@@ -38,6 +38,12 @@ struct adsData {
   float air_quality_ppm; // from MQ135
 };
 
+struct calibrationData {
+  float avg_v0;
+  float avg_v1;
+  bool valid;
+};
+
 // R0 = RL × (5.0 - V) / V
 
 // PPM computations
@@ -70,6 +76,63 @@ float calculateMQ135_PPM(float voltage) {
 
 // the ACTUAL cool stuff (RTOS)
 QueueHandle_t dhtQueue, adsQueue;
+
+const float DIVIDER_RATIO = 1.5; // inverse of 2/(1+2) in kR
+
+bool initializeADS() {
+  static bool adsInitialized = false;
+  if (adsInitialized) {
+    return true;
+  }
+
+  Wire.begin(ADC_SDA_PIN, ADC_SCL_PIN);
+  if (!ads.begin()) {
+    Serial.println("Failed to initialize ADS.");
+    return false;
+  }
+
+  ads.setGain(GAIN_ONE);
+  adsInitialized = true;
+  return true;
+}
+
+calibrationData runCalibration(uint16_t sampleCount = 50, uint32_t sampleDelayMs = 100, float loadResistor = 10.0f) {
+  calibrationData result = {0.0f, 0.0f, false};
+
+  if (!initializeADS()) {
+    return result;
+  }
+
+  float sumV0 = 0.0f;
+  float sumV1 = 0.0f;
+
+  for (uint16_t i = 0; i < sampleCount; i++) {
+    float v0 = ads.computeVolts(ads.readADC_SingleEnded(0)) * DIVIDER_RATIO;
+    float v1 = ads.computeVolts(ads.readADC_SingleEnded(1)) * DIVIDER_RATIO;
+    sumV0 += v0;
+    sumV1 += v1;
+    delay(sampleDelayMs);
+  }
+
+  result.avg_v0 = sumV0 / sampleCount;
+  result.avg_v1 = sumV1 / sampleCount;
+  result.valid = true;
+
+  float suggestedMQ3_R0 = loadResistor * (5.0f - result.avg_v0) / result.avg_v0;
+  float suggestedMQ135_R0 = loadResistor * (5.0f - result.avg_v1) / result.avg_v1;
+
+  Serial.println("=== Calibration (clean air) ===");
+  Serial.print("Average V0: ");
+  Serial.println(result.avg_v0, 4);
+  Serial.print("Average V1: ");
+  Serial.println(result.avg_v1, 4);
+  Serial.print("Suggested MQ3_RO: ");
+  Serial.println(suggestedMQ3_R0, 2);
+  Serial.print("Suggested MQ135_RO: ");
+  Serial.println(suggestedMQ135_R0, 2);
+
+  return result;
+}
 
 void blinkLed(const CRGB &color, uint32_t durationMs) {
   leds[0] = color;
@@ -110,20 +173,11 @@ void dht22Task(void *parameter) {
 }
 
 void adsTask(void *parameter) {
-  // initialize wire
-  Wire.begin(ADC_SDA_PIN, ADC_SCL_PIN);
-
-  // initialize ads
-  if (!ads.begin()) {
-    Serial.println("Failed to initialize ADS.");
+  if (!initializeADS()) {
     while(1);
   }
-  ads.setGain(GAIN_ONE);
-  adsData data;
 
-  //since the voltage is scaled down to 3.3V
-  //we need to scale it back to 5V for actual readings
-  const float DIVIDER_RATIO = 1.5; // inverse of 2/(1+2) in kR
+  adsData data;
 
   while(1) {
     float volts0, volts1;
@@ -161,6 +215,10 @@ void setup() {
   FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
   FastLED.setBrightness(BRIGHTNESS);
   blinkLed(CRGB::Green, 300);
+
+  // Optional one-shot calibration in clean air before starting tasks.
+  // calibrationData cal = runCalibration();
+
   // RTOS things
   dhtQueue = xQueueCreate(5, sizeof(dhtData));
   adsQueue = xQueueCreate(5, sizeof(adsData));
