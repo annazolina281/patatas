@@ -1,10 +1,7 @@
 #include <Arduino.h>
 #include <secrets.h>
-#include <WiFi.h>
-#include <WiFiClient.h>
 
 // libraries and definitions
-#include <BlynkSimpleEsp32.h>
 #include <Adafruit_Sensor.h>
 #include <DHT.h>
 #include <DHT_U.h>
@@ -28,7 +25,6 @@ Adafruit_ADS1115 ads;
 
 // initializations
 DHT_Unified dht(DHT22_PIN, DHTTYPE);
-static WiFiClient blynkWiFiClient;
 CRGB leds[NUM_LEDS];
 
 // structs
@@ -42,15 +38,17 @@ struct adsData {
   float air_quality_ppm; // from MQ135
 };
 
-// TODO - update the RO values after burn-in period
+// R0 = RL × (5.0 - V) / V
+
 // PPM computations
-const float MQ3_RO = 10.0; //! MUST CHANGE THESE AFTER BURN IN
+const float MQ3_RO = 96.0; // TODO: these values should be changed PER calibration
 const float MQ3_A = 0.3934;
 const float MQ3_B = -1.504;
 
-const float MQ135_RO = 10.0; //! MUST CHANGE THESE AFTER BURN IN
+const float MQ135_RO = 115.0; // TODO: these values should be changed PER calibration
 const float MQ135_A = 102.2;
 const float MQ135_B = -2.55;
+
 
 float calculateResistance(float voltage, float loadResistor = 10.0) {
   return loadResistor * (5.0 - voltage) / voltage;
@@ -72,6 +70,14 @@ float calculateMQ135_PPM(float voltage) {
 
 // the ACTUAL cool stuff (RTOS)
 QueueHandle_t dhtQueue, adsQueue;
+
+void blinkLed(const CRGB &color, uint32_t durationMs) {
+  leds[0] = color;
+  FastLED.show();
+  delay(durationMs);
+  leds[0] = CRGB::Black;
+  FastLED.show();
+}
 
 void dht22Task(void *parameter) {
   while(1) {
@@ -124,13 +130,19 @@ void adsTask(void *parameter) {
     volts0 = ads.computeVolts(ads.readADC_SingleEnded(0));
     volts1 = ads.computeVolts(ads.readADC_SingleEnded(1));
     
+    // Print raw voltages (after divider compensation)
+    Serial.print("V0: ");
+    Serial.print(volts0 * DIVIDER_RATIO);
+    Serial.print("V    |    V1: ");
+    Serial.print(volts1 * DIVIDER_RATIO);
+    Serial.print("V    |");
 
     data.alcohol_ppm = calculateMQ3_PPM(volts0 * DIVIDER_RATIO);
     data.air_quality_ppm = calculateMQ135_PPM(volts1 * DIVIDER_RATIO);
     
-    Serial.print("MQ-3: ");
+    Serial.print("PPM = MQ-3 : ");
     Serial.print(calculateMQ3_PPM(volts0 * DIVIDER_RATIO));
-    Serial.print(" MQ 135:");
+    Serial.print("    |    MQ 135:");
     Serial.println(calculateMQ135_PPM(volts1 * DIVIDER_RATIO));
 
     // push data to queue
@@ -140,60 +152,6 @@ void adsTask(void *parameter) {
 
 }
 
-void blynkTask(void *parameter) {
-  // connect to wifi first
-  WiFi.begin(ssid, pass);
-  while (WiFi.status() != WL_CONNECTED) {
-    vTaskDelay(500 / portTICK_PERIOD_MS);
-    Serial.print("."); 
-  }
-  Serial.println("Connected to WiFi."); 
-  leds[0] = CRGB::Red;
-  FastLED.show();
-  leds[0] = CRGB::Black;
-  FastLED.show();
-  vTaskDelay(1000 / portTICK_PERIOD_MS); 
-  
-  // then start Blynk
-  // Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass, "blynk.cloud", 80);
-  Blynk.config(BLYNK_AUTH_TOKEN, "blynk.cloud", 80);
-  Serial.println("Connected to Blynk."); 
-
-  while(1) {  
-    dhtData dht_data;
-    adsData ads_data;
-    if (xQueueReceive(dhtQueue, &dht_data, 500 / portTICK_PERIOD_MS)) {
-      if(xQueueReceive(adsQueue, &ads_data, 100 / portTICK_PERIOD_MS)) {
-        if (Blynk.connected()) {
-          Blynk.virtualWrite(V0, dht_data.temperature);
-          Blynk.virtualWrite(V1, dht_data.humidity);
-          Blynk.virtualWrite(V2, ads_data.alcohol_ppm);
-          Blynk.virtualWrite(V3, ads_data.air_quality_ppm);
-          
-          Serial.print("uploaded: ");
-          Serial.print(dht_data.temperature);
-          Serial.print("°C, ");
-          Serial.print(dht_data.humidity);
-          Serial.print("%, ");
-          Serial.print(ads_data.alcohol_ppm);
-          Serial.print("ppm, ");
-          Serial.print(ads_data.air_quality_ppm);
-          Serial.println("ppm");
-
-          // blink led after uploading
-          leds[0] = CRGB::Blue;
-          FastLED.show();
-          vTaskDelay(500 / portTICK_PERIOD_MS); 
-          leds[0] = CRGB::Black;
-          FastLED.show();
-        }
-
-      }
-    }
-    Blynk.run();
-    vTaskDelay(20000 / portTICK_PERIOD_MS);
-  }
-}
 
 void setup() {
   Serial.begin(115200);
@@ -202,13 +160,13 @@ void setup() {
   //FastLED
   FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
   FastLED.setBrightness(BRIGHTNESS);
+  blinkLed(CRGB::Green, 300);
   // RTOS things
   dhtQueue = xQueueCreate(5, sizeof(dhtData));
   adsQueue = xQueueCreate(5, sizeof(adsData));
   // tasks
   xTaskCreatePinnedToCore(dht22Task, "DHT22", 2048, NULL, 10, NULL, 1);
   xTaskCreatePinnedToCore(adsTask, "ADS", 2048, NULL, 10, NULL, 1);
-  xTaskCreatePinnedToCore(blynkTask, "Blynk", 8192, NULL, 10, NULL, 0);
 }
 
 void loop() {
